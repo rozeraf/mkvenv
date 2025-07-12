@@ -1,0 +1,589 @@
+#!/usr/bin/env bash
+
+# Скрипт для управления виртуальными окружениями Python
+# Автор: venv-manager v1.0
+# Использование: mkvenv [команда] [опции]
+
+set -e
+
+# Цвета для вывода
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Конфигурация
+DEFAULT_VENV_NAME=".venv"
+DEFAULT_PACKAGES="pip wheel setuptools pip-tools"
+CONFIG_FILE="$HOME/.venv-manager.conf"
+
+# Функция для цветного вывода
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Функция для показа помощи
+show_help() {
+    cat << EOF
+🐍 venv-manager - Утилита для управления виртуальными окружениями Python
+
+ИСПОЛЬЗОВАНИЕ:
+    mkvenv [команда] [опции]
+
+КОМАНДЫ:
+    create, c           Создать новое виртуальное окружение
+    activate, a         Активировать существующее окружение
+    deactivate, d       Деактивировать текущее окружение
+    remove, rm          Удалить виртуальное окружение
+    list, ls            Показать список окружений в текущей директории
+    info, i             Показать информацию о текущем окружении
+    upgrade, up         Обновить pip и базовые пакеты
+    requirements, req   Работа с requirements.txt
+    clean               Очистить кеш pip
+    config              Настройка конфигурации
+    interactive, int    Интерактивный режим создания окружения
+    help, h             Показать эту справку
+
+ОПЦИИ:
+    -n, --name NAME     Имя виртуального окружения (по умолчанию: .venv)
+    -p, --python VER    Версия Python (по умолчанию: глобальная из pyenv)
+    -f, --force         Принудительно перезаписать существующее окружение
+    -a, --activate      Автоматически активировать после создания
+    --no-packages       Не устанавливать базовые пакеты
+    --with-packages PKG Дополнительные пакеты для установки
+
+ПРИМЕРЫ:
+    mkvenv                           # Создать .venv с глобальной версией Python и активировать
+    mkvenv interactive               # Интерактивный режим создания окружения
+    mkvenv c -n myproject -p 3.11    # Создать окружение с Python 3.11
+    mkvenv a                         # Активировать .venv
+    mkvenv rm -n myproject           # Удалить окружение myproject
+    mkvenv create --with-packages "django fastapi"  # Создать с дополнительными пакетами
+    mkvenv info                      # Показать информацию о текущем окружении
+
+EOF
+}
+
+# Загрузка конфигурации
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    fi
+}
+
+# Сохранение конфигурации
+save_config() {
+    cat > "$CONFIG_FILE" << EOF
+# Конфигурация venv-manager
+DEFAULT_VENV_NAME="$DEFAULT_VENV_NAME"
+DEFAULT_PACKAGES="$DEFAULT_PACKAGES"
+EOF
+    print_success "Конфигурация сохранена в $CONFIG_FILE"
+}
+
+# Получение версии Python
+get_python_version() {
+    local version="$1"
+    
+    if [[ -n "$version" ]]; then
+        # Проверяем, установлена ли указанная версия через pyenv
+        if command -v pyenv >/dev/null 2>&1; then
+            if pyenv versions --bare | grep -q "^$version$"; then
+                echo "$HOME/.pyenv/versions/$version/bin/python"
+                return 0
+            fi
+        fi
+        
+        # Ищем в системе
+        if command -v "python$version" >/dev/null 2>&1; then
+            echo "python$version"
+            return 0
+        fi
+        
+        print_error "Python $version не найден"
+        return 1
+    fi
+    
+    # Автоматическое определение версии
+    if command -v pyenv >/dev/null 2>&1; then
+        local global_version=$(pyenv global)
+        local python_path="$HOME/.pyenv/versions/$global_version/bin/python"
+        
+        if [[ -x "$python_path" ]]; then
+            echo "$python_path"
+            return 0
+        fi
+    fi
+    
+    # Fallback на системный Python
+    if command -v python3 >/dev/null 2>&1; then
+        echo "python3"
+        return 0
+    elif command -v python >/dev/null 2>&1; then
+        echo "python"
+        return 0
+    fi
+    
+    print_error "Python не найден в системе"
+    return 1
+}
+
+# Создание виртуального окружения
+create_venv() {
+    local venv_name="$DEFAULT_VENV_NAME"
+    local python_version=""
+    local force=false
+    local activate_after=false
+    local install_packages=true
+    local additional_packages=""
+    
+    # Парсинг аргументов
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -n|--name)
+                venv_name="$2"
+                shift 2
+                ;;
+            -p|--python)
+                python_version="$2"
+                shift 2
+                ;;
+            -f|--force)
+                force=true
+                shift
+                ;;
+            -a|--activate)
+                activate_after=true
+                shift
+                ;;
+            --no-packages)
+                install_packages=false
+                shift
+                ;;
+            --with-packages)
+                additional_packages="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+    
+    # Проверка существования
+    if [[ -d "$venv_name" ]]; then
+        if [[ "$force" == true ]]; then
+            print_warning "Удаляю существующее окружение $venv_name"
+            rm -rf "$venv_name"
+        else
+            print_error "Окружение $venv_name уже существует. Используйте -f для перезаписи"
+            return 1
+        fi
+    fi
+    
+    # Получение интерпретатора Python
+    local python_path
+    python_path=$(get_python_version "$python_version")
+    [[ $? -ne 0 ]] && return 1
+    
+    # Получение информации о версии
+    local version_info
+    version_info=$("$python_path" --version 2>&1)
+    print_info "Создание виртуального окружения с $version_info"
+    print_info "Путь к интерпретатору: $python_path"
+    
+    # Создание виртуального окружения
+    print_info "Создание окружения в $venv_name..."
+    "$python_path" -m venv "$venv_name"
+    
+    # Обновление pip
+    print_info "Обновление pip..."
+    "$venv_name/bin/pip" install --upgrade pip
+    
+    # Установка базовых пакетов
+    if [[ "$install_packages" == true ]]; then
+        print_info "Установка базовых пакетов: $DEFAULT_PACKAGES"
+        "$venv_name/bin/pip" install $DEFAULT_PACKAGES
+    fi
+    
+    # Установка дополнительных пакетов
+    if [[ -n "$additional_packages" ]]; then
+        print_info "Установка дополнительных пакетов: $additional_packages"
+        "$venv_name/bin/pip" install $additional_packages
+    fi
+    
+    # Установка из requirements.txt если существует
+    if [[ -f "requirements.txt" ]]; then
+        print_info "Найден requirements.txt, устанавливаю зависимости..."
+        "$venv_name/bin/pip" install -r requirements.txt
+    fi
+    
+    print_success "Виртуальное окружение создано: $venv_name"
+    
+    # Активация
+    if [[ "$activate_after" == true ]]; then
+        print_success "Окружение создано и готово к активации!"
+        print_info "Выполните следующие команды для активации:"
+        echo
+        echo "  source $venv_name/bin/activate"
+        echo
+        
+        # Создаем временный скрипт для автоматической активации
+        local activate_script="/tmp/activate_venv_$.sh"
+        cat > "$activate_script" << EOF
+#!/bin/bash
+cd "$(pwd)"
+source $venv_name/bin/activate
+exec \$SHELL
+EOF
+        chmod +x "$activate_script"
+        
+        print_info "Или запустите новый shell с активированным окружением:"
+        echo "  $activate_script"
+        echo
+        
+        # Автоматически запускаем новый shell с активированным окружением
+        read -p "Запустить новый shell с активированным окружением? (Y/n): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            print_info "Запуск нового shell..."
+            exec bash -c "cd '$(pwd)' && source $venv_name/bin/activate && exec \$SHELL"
+        fi
+    else
+        print_info "Для активации выполните: source $venv_name/bin/activate"
+    fi
+}
+
+# Активация виртуального окружения
+activate_venv() {
+    local venv_name="$DEFAULT_VENV_NAME"
+    
+    if [[ $# -gt 0 ]]; then
+        case $1 in
+            -n|--name)
+                venv_name="$2"
+                ;;
+            *)
+                venv_name="$1"
+                ;;
+        esac
+    fi
+    
+    if [[ ! -d "$venv_name" ]]; then
+        print_error "Виртуальное окружение $venv_name не найдено"
+        return 1
+    fi
+    
+    print_info "Для активации выполните: source $venv_name/bin/activate"
+}
+
+# Удаление виртуального окружения
+remove_venv() {
+    local venv_name="$DEFAULT_VENV_NAME"
+    
+    if [[ $# -gt 0 ]]; then
+        case $1 in
+            -n|--name)
+                venv_name="$2"
+                ;;
+            *)
+                venv_name="$1"
+                ;;
+        esac
+    fi
+    
+    if [[ ! -d "$venv_name" ]]; then
+        print_error "Виртуальное окружение $venv_name не найдено"
+        return 1
+    fi
+    
+    read -p "Удалить виртуальное окружение $venv_name? (y/N): " -n 1 -r
+    echo
+    
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rm -rf "$venv_name"
+        print_success "Виртуальное окружение $venv_name удалено"
+    else
+        print_info "Отменено"
+    fi
+}
+
+# Список виртуальных окружений
+list_venvs() {
+    print_info "Виртуальные окружения в текущей директории:"
+    
+    local found=false
+    for dir in .venv* venv* env*; do
+        if [[ -d "$dir" && -f "$dir/bin/activate" ]]; then
+            echo "  📁 $dir"
+            found=true
+        fi
+    done
+    
+    if [[ "$found" == false ]]; then
+        print_warning "Виртуальные окружения не найдены"
+    fi
+}
+
+# Информация о виртуальном окружении
+show_info() {
+    if [[ -n "$VIRTUAL_ENV" ]]; then
+        print_info "Текущее активное окружение: $VIRTUAL_ENV"
+        print_info "Версия Python: $(python --version)"
+        print_info "Pip версия: $(pip --version)"
+        print_info "Установленные пакеты:"
+        pip list --format=columns
+    else
+        print_warning "Виртуальное окружение не активировано"
+        
+        # Проверяем локальные окружения
+        if [[ -d ".venv" ]]; then
+            print_info "Найдено локальное окружение .venv"
+            print_info "Версия Python: $(.venv/bin/python --version)"
+        fi
+    fi
+}
+
+# Обновление пакетов
+upgrade_packages() {
+    if [[ -n "$VIRTUAL_ENV" ]]; then
+        print_info "Обновление pip и базовых пакетов..."
+        pip install --upgrade pip $DEFAULT_PACKAGES
+        print_success "Пакеты обновлены"
+    else
+        print_error "Виртуальное окружение не активировано"
+        return 1
+    fi
+}
+
+# Работа с requirements
+manage_requirements() {
+    local action="$1"
+    
+    case "$action" in
+        freeze)
+            if [[ -n "$VIRTUAL_ENV" ]]; then
+                pip freeze > requirements.txt
+                print_success "requirements.txt создан"
+            else
+                print_error "Виртуальное окружение не активировано"
+            fi
+            ;;
+        install)
+            if [[ -f "requirements.txt" ]]; then
+                pip install -r requirements.txt
+                print_success "Зависимости установлены"
+            else
+                print_error "requirements.txt не найден"
+            fi
+            ;;
+        *)
+            print_info "Доступные команды: freeze, install"
+            ;;
+    esac
+}
+
+# Очистка кеша
+clean_cache() {
+    if command -v pip >/dev/null 2>&1; then
+        print_info "Очистка кеша pip..."
+        pip cache purge
+        print_success "Кеш очищен"
+    fi
+}
+
+# Настройка конфигурации
+configure() {
+    if command -v pip >/dev/null 2>&1; then
+        print_info "Очистка кеша pip..."
+        pip cache purge
+        print_success "Кеш очищен"
+    fi
+}
+
+# Интерактивный режим создания окружения
+interactive_create() {
+    print_info "🎛️  Интерактивный режим создания виртуального окружения"
+    echo
+    
+    # Имя окружения
+    read -p "Имя виртуального окружения [$DEFAULT_VENV_NAME]: " venv_name
+    venv_name="${venv_name:-$DEFAULT_VENV_NAME}"
+    
+    # Проверка существования
+    if [[ -d "$venv_name" ]]; then
+        read -p "Окружение $venv_name уже существует. Перезаписать? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            print_info "Отменено"
+            return 0
+        fi
+    fi
+    
+    # Выбор версии Python
+    echo
+    print_info "Доступные версии Python:"
+    
+    local versions=()
+    local counter=1
+    
+    # Добавляем глобальную версию pyenv
+    if command -v pyenv >/dev/null 2>&1; then
+        local global_version=$(pyenv global 2>/dev/null)
+        if [[ -n "$global_version" ]]; then
+            versions+=("$global_version (глобальная pyenv)")
+            echo "  $counter) $global_version (глобальная pyenv)"
+            ((counter++))
+        fi
+        
+        # Добавляем другие версии pyenv
+        while IFS= read -r version; do
+            if [[ "$version" != "$global_version" ]]; then
+                versions+=("$version")
+                echo "  $counter) $version"
+                ((counter++))
+            fi
+        done < <(pyenv versions --bare 2>/dev/null)
+    fi
+    
+    # Системные версии
+    for py_cmd in python3.12 python3.11 python3.10 python3.9 python3 python; do
+        if command -v "$py_cmd" >/dev/null 2>&1; then
+            local py_version=$("$py_cmd" --version 2>&1 | cut -d' ' -f2)
+            local found=false
+            for existing in "${versions[@]}"; do
+                if [[ "$existing" == *"$py_version"* ]]; then
+                    found=true
+                    break
+                fi
+            done
+            
+            if [[ "$found" == false ]]; then
+                versions+=("$py_cmd ($py_version)")
+                echo "  $counter) $py_cmd ($py_version)"
+                ((counter++))
+            fi
+        fi
+    done
+    
+    echo
+    read -p "Выберите версию Python [1]: " py_choice
+    py_choice=${py_choice:-1}
+    
+    if [[ "$py_choice" -ge 1 && "$py_choice" -le "${#versions[@]}" ]]; then
+        local selected_version="${versions[$((py_choice-1))]}"
+        # Извлекаем версию из строки
+        local python_version=$(echo "$selected_version" | cut -d' ' -f1)
+    else
+        print_error "Неверный выбор"
+        return 1
+    fi
+    
+    # Дополнительные пакеты
+    echo
+    print_info "Базовые пакеты: $DEFAULT_PACKAGES"
+    read -p "Дополнительные пакеты (через пробел): " additional_packages
+    
+    # Автоматическая активация
+    echo
+    read -p "Активировать окружение после создания? (Y/n): " -n 1 -r
+    echo
+    local activate_after=true
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+        activate_after=false
+    fi
+    
+    # Создание окружения
+    echo
+    print_info "Создание окружения с параметрами:"
+    print_info "  Имя: $venv_name"
+    print_info "  Python: $selected_version"
+    print_info "  Дополнительные пакеты: ${additional_packages:-отсутствуют}"
+    print_info "  Активация: $activate_after"
+    echo
+    
+    # Создаем окружение
+    local args=("-n" "$venv_name" "-p" "$python_version")
+    if [[ "$activate_after" == true ]]; then
+        args+=("-a")
+    fi
+    if [[ -n "$additional_packages" ]]; then
+        args+=("--with-packages" "$additional_packages")
+    fi
+    
+    create_venv "${args[@]}"
+}
+    echo "🔧 Настройка venv-manager"
+    echo
+    
+    read -p "Имя виртуального окружения по умолчанию [$DEFAULT_VENV_NAME]: " new_name
+    DEFAULT_VENV_NAME="${new_name:-$DEFAULT_VENV_NAME}"
+    
+    read -p "Базовые пакеты [$DEFAULT_PACKAGES]: " new_packages
+    DEFAULT_PACKAGES="${new_packages:-$DEFAULT_PACKAGES}"
+    
+    save_config
+}
+
+# Основная функция
+main() {
+    load_config
+    
+    if [[ $# -eq 0 ]]; then
+        # Если нет аргументов, создаём окружение с настройками по умолчанию и активируем
+        create_venv -a
+        return
+    fi
+    
+    local command="$1"
+    shift
+    
+    case "$command" in
+        create|c)
+            create_venv "$@"
+            ;;
+        activate|a)
+            activate_venv "$@"
+            ;;
+        deactivate|d)
+            print_info "Для деактивации выполните: deactivate"
+            ;;
+        remove|rm)
+            remove_venv "$@"
+            ;;
+        list|ls)
+            list_venvs
+            ;;
+        info|i)
+            show_info
+            ;;
+        upgrade|up)
+            upgrade_packages
+            ;;
+        requirements|req)
+            manage_requirements "$@"
+            ;;
+        clean)
+            clean_cache
+            ;;
+        interactive|int)
+            interactive_create
+            ;;
+        config)
+            configure
+            ;;
+        help|h|--help)
+            show_help
+            ;;
+        *)
+            print_error "Неизвестная команда: $command"
+            print_info "Используйте 'mkvenv help' для справки"
+            return 1
+            ;;
+    esac
+}
+
+# Запуск основной функции
+main "$@"
